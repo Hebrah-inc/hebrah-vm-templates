@@ -1,3 +1,15 @@
 result
 .direnv
 
+# Python (guest package scripts under packages/)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# macOS / editor
+.DS_Store
+.idea/
+.vscode/
+
+ARTIFACT_VERSION
