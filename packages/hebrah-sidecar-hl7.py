@@ -7,6 +7,8 @@ import json
 import os
 import re
 import socket
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -103,6 +105,23 @@ def post_internal_event(env: dict[str, str], payload: dict) -> tuple[bool, str]:
         return False, str(exc.reason)
 
 
+def write_ack(config_dir: Path, payload: dict) -> None:
+    text = json.dumps(payload, indent=2) + "\n"
+    path = config_dir / "hl7_ack.json"
+    try:
+        proc = subprocess.run(
+            ["/bin/sh", "-c", "cat > \"$1\"", "sh", str(path)],
+            input=text,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return
+        path.write_text(text)
+    except OSError:
+        path.write_text(text)
+
+
 def handle_hl7_message(message: str, env: dict[str, str], config_dir: Path) -> dict:
     parsed = parse_hl7(message)
     ack = build_ack(parsed)
@@ -142,7 +161,7 @@ def handle_hl7_message(message: str, env: dict[str, str], config_dir: Path) -> d
         "ack_message_hl7": ack,
     }
     config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "hl7_ack.json").write_text(json.dumps(result, indent=2) + "\n")
+    write_ack(config_dir, result)
     return result
 
 
@@ -177,6 +196,70 @@ class InjectHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+_EMPTY_INJECT = '{"message":""}\n'
+
+
+def _refresh_9p_dir(config_dir: Path) -> None:
+    """Force 9p dentry refresh so host overwrites of pre-created files are visible."""
+    try:
+        list(config_dir.iterdir())
+    except OSError:
+        pass
+
+
+def _clear_inject_file(inject_path: Path) -> None:
+    """Reset inject slot; keep file so QEMU 9p does not need a new host dentry."""
+    try:
+        inject_path.write_text(_EMPTY_INJECT)
+    except OSError:
+        inject_path.unlink(missing_ok=True)
+
+
+def _read_inject_message(inject_path: Path) -> str | None:
+    _refresh_9p_dir(inject_path.parent)
+    if not inject_path.is_file():
+        return None
+    try:
+        raw = inject_path.read_bytes()
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    message = payload.get("message") or ""
+    return message or None
+
+
+def process_inject_file(config_dir: Path) -> bool:
+    """Process hl7_inject.json if present; return True when handled."""
+    inject_path = config_dir / "hl7_inject.json"
+    message = _read_inject_message(inject_path)
+    if not message:
+        return False
+    env = load_env(config_dir / "hebrah.env")
+    handle_hl7_message(message, env, config_dir)
+    _clear_inject_file(inject_path)
+    return True
+
+
+def poll_9p_inject(config_dir: Path) -> None:
+    """Process hl7_inject.json dropped on the 9p share (nested QEMU hostfwd fallback)."""
+    inject_path = config_dir / "hl7_inject.json"
+    while True:
+        message = _read_inject_message(inject_path)
+        if message:
+            env = load_env(config_dir / "hebrah.env")
+            try:
+                handle_hl7_message(message, env, config_dir)
+                _clear_inject_file(inject_path)
+            except (OSError, ValueError, urllib.error.URLError):
+                pass
+        time.sleep(0.25)
 
 
 def serve_mllp(env: dict[str, str], config_dir: Path, port: int) -> None:
@@ -215,8 +298,17 @@ def main() -> None:
     InjectHandler.config_dir = config_dir
     http_server = HTTPServer(("0.0.0.0", http_port), InjectHandler)
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
+    threading.Thread(target=poll_9p_inject, args=(config_dir,), daemon=True).start()
     serve_mllp(env, config_dir, mllp_port)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--inject-file":
+        config_dir = Path(os.environ.get("HEBRAH_CONFIG_DIR", "/hebrah-config"))
+        try:
+            process_inject_file(config_dir)
+        except Exception as exc:
+            print(f"hebrah-sidecar-hl7 inject-file: {exc}", file=sys.stderr)
+        sys.exit(0)
+    else:
+        main()
