@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -79,26 +81,36 @@ def wait_for_config_mount(config_dir: Path, *, timeout_sec: float = 30.0) -> boo
     return config_mount_ready(config_dir)
 
 
+def synthetic_ehr_ready(config_dir: Path) -> bool:
+    env = load_env(config_dir / "hebrah.env")
+    port = int(env.get("HEBRAH_SYNTHETIC_EHR_PORT", "8090"))
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metadata", timeout=2) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
 def build_payload(config_dir: Path) -> dict:
     env_file = config_dir / "hebrah.env"
     env = load_env(env_file)
     vm_id = env.get("HEBRAH_VM_ID", os.environ.get("HEBRAH_VM_ID", "unknown"))
+    ehr_ready = synthetic_ehr_ready(config_dir)
     return {
-        "status": "ok",
+        "status": "ok" if ehr_ready else "starting",
         "vm_id": vm_id,
-        "stage": "ready",
+        "stage": "ready" if ehr_ready else "synthetic_ehr_boot",
         "org_id": env.get("HEBRAH_ORG_ID"),
         "connection_id": env.get("HEBRAH_CONNECTION_ID"),
         "environment": env.get("HEBRAH_ENVIRONMENT"),
+        "synthetic_ehr_ready": ehr_ready,
+        "ehr_vendor": env.get("HEBRAH_EHR_VENDOR"),
+        "ehr_model_version": env.get("HEBRAH_EHR_MODEL_VERSION"),
     }
 
 
 class Handler(BaseHTTPRequestHandler):
     payload: dict = {}
-
-
-class HealthHTTPServer(HTTPServer):
-    allow_reuse_address = True
 
     def log_message(self, fmt: str, *args) -> None:
         return
@@ -114,6 +126,10 @@ class HealthHTTPServer(HTTPServer):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+class HealthHTTPServer(HTTPServer):
+    allow_reuse_address = True
 
 
 def refresh_payload_loop(config_dir: Path, state_dir: Path) -> None:
@@ -133,31 +149,43 @@ def main() -> None:
     state_dir = Path(os.environ.get("HEBRAH_STATE_DIR", "/var/lib/hebrah-sidecar"))
     port = int(os.environ.get("HEBRAH_HEALTH_PORT", "8080"))
 
-    if not wait_for_config_mount(config_dir):
+    # Prefer /etc/hebrah.env on Firecracker (no 9p) when present.
+    etc_env = Path("/etc/hebrah.env")
+    if etc_env.is_file() and not (config_dir / "hebrah.env").is_file():
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "hebrah.env").write_text(etc_env.read_text())
+        except OSError:
+            pass
+
+    Handler.payload = {
+        "status": "starting",
+        "vm_id": os.environ.get("HEBRAH_VM_ID", "unknown"),
+        "stage": "sidecar_boot",
+    }
+    try:
+        server = HealthHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as exc:
+        print(f"hebrah-sidecar-health: bind failed: {exc}", file=sys.stderr, flush=True)
+        raise
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"hebrah-sidecar-health: listening on 0.0.0.0:{port}", flush=True)
+
+    # Don't block forever on 9p when Firecracker only has a tmpfiles dir.
+    if not wait_for_config_mount(config_dir, timeout_sec=5.0):
         print(
-            f"hebrah-sidecar-health: {config_dir} not mounted after wait — will retry writes",
+            f"hebrah-sidecar-health: {config_dir} not ready — continuing with HTTP only",
             file=sys.stderr,
+            flush=True,
         )
 
     Handler.payload = build_payload(config_dir)
-    for attempt in range(12):
+    for _attempt in range(12):
         if persist_health(config_dir, state_dir, Handler.payload):
             break
         time.sleep(0.5)
-    else:
-        print(
-            "hebrah-sidecar-health: initial health.json write failed after retries",
-            file=sys.stderr,
-        )
 
-    server = HealthHTTPServer(("0.0.0.0", port), Handler)
-
-    threading.Thread(
-        target=refresh_payload_loop,
-        args=(config_dir, state_dir),
-        daemon=True,
-    ).start()
-    server.serve_forever()
+    refresh_payload_loop(config_dir, state_dir)
 
 
 if __name__ == "__main__":

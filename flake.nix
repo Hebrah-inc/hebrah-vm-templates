@@ -25,7 +25,7 @@
         else
           hostSystem;
 
-      hebrahQemuExtraArgsScript = hypervisor: guestPkgs:
+      hebrahQemuExtraArgsScript = hypervisor: guestPkgs: qemuMachine:
         guestPkgs.writeShellScript "hebrah-extra-args" ''
           set -euo pipefail
           CONFIG_DIR="''${HEBRAH_VM_CONFIG_DIR:?HEBRAH_VM_CONFIG_DIR required}"
@@ -33,12 +33,19 @@
           WB_PORT="''${HEBRAH_WRITEBACK_HOST_PORT:-$((PORT + 1))}"
           HL7_PORT="''${HEBRAH_HL7_HOST_PORT:-$((PORT + 2))}"
           MLLP_PORT="''${HEBRAH_MLLP_HOST_PORT:-$((PORT + 3))}"
+          FHIR_PORT="''${HEBRAH_FHIR_HOST_PORT:-$((PORT + 4))}"
           HYP="${hypervisor}"
           if [ "$HYP" = "qemu" ]; then
-            echo "-netdev user,id=hebrah0,hostfwd=tcp:127.0.0.1:''${PORT}-:8080,hostfwd=tcp:127.0.0.1:''${WB_PORT}-:8082,hostfwd=tcp:127.0.0.1:''${HL7_PORT}-:8083,hostfwd=tcp:127.0.0.1:''${MLLP_PORT}-:2575"
-            echo "-device virtio-net-device,netdev=hebrah0"
-            echo "-fsdev local,id=hebrahconfig,path=''${CONFIG_DIR},security_model=mapped-xattr,fmode=0644,dmode=0755,writeout=immediate"
-            echo "-device virtio-9p-device,mount_tag=hebrah-config,fsdev=hebrahconfig"
+            echo "-netdev user,id=hebrah0,hostfwd=tcp:127.0.0.1:''${PORT}-:8080,hostfwd=tcp:127.0.0.1:''${WB_PORT}-:8082,hostfwd=tcp:127.0.0.1:''${HL7_PORT}-:8083,hostfwd=tcp:127.0.0.1:''${MLLP_PORT}-:2575,hostfwd=tcp:127.0.0.1:''${FHIR_PORT}-:8090"
+            if [ "${qemuMachine}" = "microvm" ]; then
+              echo "-device virtio-net-device,netdev=hebrah0"
+              echo "-fsdev local,id=hebrahconfig,path=''${CONFIG_DIR},security_model=mapped-xattr,fmode=0644,dmode=0755,writeout=immediate"
+              echo "-device virtio-9p-device,mount_tag=hebrah-config,fsdev=hebrahconfig"
+            else
+              echo "-device virtio-net-pci,netdev=hebrah0"
+              echo "-fsdev local,id=hebrahconfig,path=''${CONFIG_DIR},security_model=mapped-xattr,fmode=0644,dmode=0755,writeout=immediate"
+              echo "-device virtio-9p-pci,mount_tag=hebrah-config,fsdev=hebrahconfig"
+            fi
           elif [ "$HYP" = "vfkit" ]; then
             echo "--device virtio-fs,sharedDir=''${CONFIG_DIR},mountTag=hebrah-config"
           fi
@@ -46,6 +53,11 @@
 
       templateSpecs = {
         sidecar-base = {
+          hostName = "hebrah-sidecar";
+          module = ./templates/sidecar/sidecar-module.nix;
+          serviceOption = "services.hebrah-sidecar.enable";
+        };
+        sidecar-base-fc = {
           hostName = "hebrah-sidecar";
           module = ./templates/sidecar/sidecar-module.nix;
           serviceOption = "services.hebrah-sidecar.enable";
@@ -69,6 +81,11 @@
 
       mkMicrovmModule = { name, extraModule, hypervisor }:
         { guestSystem, guestPkgs }:
+        let
+          # qemu-for-vm-tests on Linux lacks "virt"; use microvm machine + virtio-net-device.
+          qemuMachine =
+            if guestSystem == "x86_64-linux" then "microvm" else "virt";
+        in
         [
           microvm.nixosModules.microvm
           extraModule
@@ -77,16 +94,34 @@
             system.stateVersion = "24.11";
             microvm = {
               vcpu = 1;
-              mem = 1024;
+              mem = if hypervisor == "firecracker" then 768 else 1024;
+              cpu = "max";
               inherit hypervisor;
-              qemu.machine = "microvm";
+              qemu.machine = qemuMachine;
               volumes = [
                 { mountPoint = "/var"; image = "var.img"; size = 256; }
               ];
-              interfaces = guestPkgs.lib.optionals (hypervisor != "qemu") [
-                { type = "user"; id = "eth0"; mac = "02:fc:00:00:00:01"; }
-              ];
-              extraArgsScript = "${hebrahQemuExtraArgsScript hypervisor guestPkgs}";
+              # QEMU/vfkit: user-mode net + hostfwd via extraArgsScript.
+              # Firecracker: tap only (user net unsupported); launch.sh creates/patches tap at runtime.
+              interfaces =
+                if hypervisor == "firecracker" then [
+                  { type = "tap"; id = "hb-fc0"; mac = "02:fc:00:00:00:01"; }
+                ] else guestPkgs.lib.optionals (hypervisor != "qemu") [
+                  { type = "user"; id = "eth0"; mac = "02:fc:00:00:00:01"; }
+                ];
+              socket = guestPkgs.lib.mkIf (hypervisor == "firecracker") "firecracker.sock";
+              firecracker = guestPkgs.lib.optionalAttrs (hypervisor == "firecracker") {
+                extraConfig = {
+                  mmds-config = {
+                    version = "V1";
+                    ipv4_address = "169.254.169.254";
+                    network_interfaces = [ "hb-fc0" ];
+                  };
+                };
+              };
+              extraArgsScript = guestPkgs.lib.optionalString (hypervisor == "qemu" || hypervisor == "vfkit")
+                "${hebrahQemuExtraArgsScript hypervisor guestPkgs qemuMachine}";
+              balloon = false;
             };
           }
         ];
@@ -107,7 +142,9 @@
           spec = templateSpecs.${templateId};
           guestSystem = guestSystemForHost hostSystem;
           pkgs = nixpkgs.legacyPackages.${hostSystem};
-          hypervisor = "qemu";
+          hypervisor =
+            if templateId == "sidecar-base-fc" then "firecracker"
+            else "qemu";
           guestCfg = mkGuestConfig {
             name = spec.hostName;
             extraModule = spec.module;
@@ -132,28 +169,39 @@
           {
             "template_id": "${templateId}",
             "guest_system": "${guestSystem}",
-            "hypervisor": "qemu",
+            "hypervisor": "${hypervisor}",
             "host_system": "${hostSystem}"
           }
           EOF
-          cat > $out/launch.sh <<'LAUNCH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          GOLDEN_DIR="$(cd "$(dirname "$0")" && pwd)"
-          RUNNER="$GOLDEN_DIR/runner/bin/microvm-run"
-          if [ ! -x "$RUNNER" ]; then
-            RUNNER="$(find "$GOLDEN_DIR/runner/bin" -maxdepth 1 -type f -perm -111 2>/dev/null | head -1)"
-          fi
-          if [ ! -x "$RUNNER" ]; then
-            echo "microvm runner not found under $GOLDEN_DIR/runner/bin" >&2
-            exit 1
-          fi
-          LOGFILE="''${HEBRAH_VM_LOGFILE:-''${HEBRAH_VM_CONFIG_DIR:?}/vm.log}"
-          mkdir -p "$(dirname "$LOGFILE")"
-          nohup "$RUNNER" >"$LOGFILE" 2>&1 &
-          echo $! > "''${HEBRAH_VM_PIDFILE:?}"
-          LAUNCH
-          chmod +x $out/launch.sh
+          ${if hypervisor == "firecracker" then ''
+            cp ${./scripts/launch-firecracker.sh} $out/launch.sh
+            cp ${./scripts/fc-snapshot-lib.sh} $out/fc-snapshot-lib.sh
+            chmod +x $out/launch.sh $out/fc-snapshot-lib.sh
+            # Pre-baked var.img for pool snapshot refill (skips mkfs.ext4 per slot).
+            truncate -s 256M $out/var.img
+            ${pkgs.e2fsprogs}/bin/mkfs.ext4 -F -L var $out/var.img
+          '' else ''
+            cat > $out/launch.sh <<'LAUNCH'
+            #!/usr/bin/env bash
+            set -euo pipefail
+            GOLDEN_DIR="$(cd "$(dirname "$0")" && pwd)"
+            RUNNER="$GOLDEN_DIR/runner/bin/microvm-run"
+            if [ ! -x "$RUNNER" ]; then
+              RUNNER="$(find "$GOLDEN_DIR/runner/bin" -maxdepth 1 -type f -perm -111 2>/dev/null | head -1)"
+            fi
+            if [ ! -x "$RUNNER" ]; then
+              echo "microvm runner not found under $GOLDEN_DIR/runner/bin" >&2
+              exit 1
+            fi
+            CONFIG_DIR="''${HEBRAH_VM_CONFIG_DIR:?HEBRAH_VM_CONFIG_DIR required}"
+            LOGFILE="''${HEBRAH_VM_LOGFILE:-$CONFIG_DIR/vm.log}"
+            mkdir -p "$CONFIG_DIR" "$(dirname "$LOGFILE")"
+            cd "$CONFIG_DIR"
+            nohup "$RUNNER" >"$LOGFILE" 2>&1 &
+            echo $! > "''${HEBRAH_VM_PIDFILE:?}"
+            LAUNCH
+            chmod +x $out/launch.sh
+          ''}
         '';
 
       mkHostPackages = hostSystem:
