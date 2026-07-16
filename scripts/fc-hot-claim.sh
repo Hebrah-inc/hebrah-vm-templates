@@ -12,6 +12,8 @@ NEW_ENV="${2:-$CONFIG_DIR/hebrah.env}"
 SOCK="$CONFIG_DIR/firecracker.sock"
 HEALTH_PORT="${HEBRAH_HEALTH_HOST_PORT:?HEBRAH_HEALTH_HOST_PORT required}"
 GUEST_IP="${HEBRAH_GUEST_IP:-}"
+HOST_TAP_IP="${HEBRAH_HOST_TAP_IP:-}"
+TAP_NAME="${HEBRAH_TAP_NAME:-}"
 ADMIN_PORT="${HEBRAH_ADMIN_PORT:-8091}"
 FHIR_PORT="${HEBRAH_FHIR_HOST_PORT:-$((HEALTH_PORT + 4))}"
 
@@ -51,10 +53,18 @@ admin_post() {
   local path="$1"
   local attempt
   local base
+  local curl_iface=()
   base="$(admin_base)"
+  if [ -n "$GUEST_IP" ]; then
+    if [ -n "$TAP_NAME" ]; then
+      curl_iface=(--interface "$TAP_NAME")
+    elif [ -n "$HOST_TAP_IP" ]; then
+      curl_iface=(--interface "$HOST_TAP_IP")
+    fi
+  fi
   for attempt in 1 2 3 4 5 6 7 8; do
     if curl -sf -X POST "${base}${path}" \
-      -H "Content-Type: application/json" "${auth_hdr[@]}" >/dev/null 2>&1; then
+      -H "Content-Type: application/json" "${auth_hdr[@]}" "${curl_iface[@]}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.25

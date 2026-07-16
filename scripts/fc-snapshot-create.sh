@@ -88,6 +88,24 @@ if ! poll_health_port_fast "$HEALTH_PORT" "${HEBRAH_SNAPSHOT_BOOT_TIMEOUT_SEC:-1
   exit 1
 fi
 
+HOST_TAP_IP="${HEBRAH_HOST_TAP_IP:-10.200.250.1}"
+TAP_NAME="${HEBRAH_TAP_NAME:-hbsmoke$$}"
+SOCK="$WORK_DIR/firecracker.sock"
+if [ -S "$SOCK" ] && [ -n "$INTERNAL_SECRET" ]; then
+  fc_put_mmds "$SOCK" "$WORK_DIR/hebrah.env"
+  poll_reload_env_tap "$GUEST_IP" "$HOST_TAP_IP" "$TAP_NAME" "$INTERNAL_SECRET" || {
+    echo "smoke VM reload-env tap timeout — see $WORK_DIR/vm.log" >&2
+    tail -30 "$WORK_DIR/vm.log" >&2 || true
+    exit 1
+  }
+fi
+if ! poll_admin_tap "$GUEST_IP" "$HOST_TAP_IP" "$TAP_NAME" "$INTERNAL_SECRET"; then
+  echo "smoke VM admin :8091 tap timeout — see $WORK_DIR/vm.log" >&2
+  tail -30 "$WORK_DIR/vm.log" >&2 || true
+  exit 1
+fi
+admin_post_tap "$GUEST_IP" "$HOST_TAP_IP" "$TAP_NAME" "$INTERNAL_SECRET" "/admin/handoff-complete" || true
+
 SOCK="$WORK_DIR/firecracker.sock"
 echo "==> Pausing VM and creating snapshot"
 fc_patch_vm_state "$SOCK" Paused

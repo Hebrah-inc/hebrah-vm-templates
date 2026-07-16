@@ -72,3 +72,56 @@ poll_health_port() {
 poll_health_port_fast() {
   poll_health_port "$1" "${2:-60}" 250
 }
+
+poll_admin_tap() {
+  local guest_ip="$1" host_tap_ip="$2" tap_name="$3" secret="${4:-}" admin_port="${5:-8091}"
+  local bind_iface="${tap_name:-$host_tap_ip}"
+  local deadline=$((SECONDS + ${HEBRAH_SNAPSHOT_ADMIN_TIMEOUT_SEC:-30}))
+  local auth_hdr=()
+  if [ -n "$secret" ]; then
+    auth_hdr=(-H "X-Hebrah-Internal-Secret: ${secret}")
+  fi
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -sf --connect-timeout 1 --max-time 2 \
+      --interface "$bind_iface" \
+      -X POST "http://${guest_ip}:${admin_port}/admin/handoff-begin" \
+      -H "Content-Type: application/json" "${auth_hdr[@]}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+poll_reload_env_tap() {
+  local guest_ip="$1" host_tap_ip="$2" tap_name="$3" secret="${4:-}" admin_port="${5:-8091}"
+  local bind_iface="${tap_name:-$host_tap_ip}"
+  local deadline=$((SECONDS + ${HEBRAH_SNAPSHOT_ADMIN_TIMEOUT_SEC:-30}))
+  local auth_hdr=()
+  if [ -n "$secret" ]; then
+    auth_hdr=(-H "X-Hebrah-Internal-Secret: ${secret}")
+  fi
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -sf --connect-timeout 1 --max-time 2 \
+      --interface "$bind_iface" \
+      -X POST "http://${guest_ip}:${admin_port}/admin/reload-env" \
+      -H "Content-Type: application/json" "${auth_hdr[@]}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+admin_post_tap() {
+  local guest_ip="$1" host_tap_ip="$2" tap_name="$3" secret="${4:-}" path="$5" admin_port="${6:-8091}"
+  local bind_iface="${tap_name:-$host_tap_ip}"
+  local auth_hdr=()
+  if [ -n "$secret" ]; then
+    auth_hdr=(-H "X-Hebrah-Internal-Secret: ${secret}")
+  fi
+  curl -sf --connect-timeout 2 --max-time 3 \
+    --interface "$bind_iface" \
+    -X POST "http://${guest_ip}:${admin_port}${path}" \
+    -H "Content-Type: application/json" "${auth_hdr[@]}" >/dev/null 2>&1
+}
