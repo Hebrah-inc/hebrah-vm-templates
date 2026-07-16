@@ -6,7 +6,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -18,17 +20,48 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+_ENV_FILE_MAX_BYTES = 1 << 20
+_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _valid_env_value(value: str) -> bool:
+    return value != "" and not re.search(r"[\x00-\x1f=]", value)
+
 
 def load_env(path: Path) -> dict[str, str]:
     data: dict[str, str] = {}
-    if not path.is_file():
+    try:
+        st = os.lstat(path)
+    except OSError:
         return data
-    for line in path.read_text().splitlines():
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return data
+    if st.st_size > _ENV_FILE_MAX_BYTES:
+        return data
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return data
+    try:
+        raw = os.read(fd, _ENV_FILE_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > _ENV_FILE_MAX_BYTES:
+        return data
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return data
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        data[key.strip()] = value.strip()
+        key_s = key.strip()
+        val_s = value.strip()
+        if key_s in data or not _ENV_KEY_RE.fullmatch(key_s) or not _valid_env_value(val_s):
+            continue
+        data[key_s] = val_s
     return data
 
 
