@@ -1,5 +1,15 @@
+# Build artefacts
 result
 .direnv
+
+# Nix
+/nix/
+*.drv
+
+# Local environment — never commit
+.env
+.env.*
+!.env.example
 
 # Python (guest package scripts under packages/)
 __pycache__/
@@ -11,5 +21,21 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+**/._*
 
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# Coverage
+coverage/
+*.lcov
+
+# Test artefacts
+test-results/
+playwright-report/
+
+# Release version is generated locally by the hebrah release process
 ARTIFACT_VERSION
