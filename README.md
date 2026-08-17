@@ -1,5 +1,11 @@
 # hebrah-vm-templates
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![NixOS](https://img.shields.io/badge/NixOS-unstable-5277C3?logo=nixos&logoColor=white)](https://nixos.org/)
+[![microvm.nix](https://img.shields.io/badge/microvm.nix-supported-success?logo=nixos&logoColor=white)](https://microvm.nix.github.io/microvm.nix/)
+[![GitHub stars](https://img.shields.io/github/stars/Hebrah-inc/hebrah-vm-templates.svg?style=social)](https://github.com/Hebrah-inc/hebrah-vm-templates)
+[![GitHub issues](https://img.shields.io/github/issues/Hebrah-inc/hebrah-vm-templates.svg)](https://github.com/Hebrah-inc/hebrah-vm-templates/issues)
+
 Golden NixOS microVM templates for the [Hebrah](https://github.com/Hebrah-inc)
 sandbox platform — sidecar, Python, Node, and static workloads.
 
