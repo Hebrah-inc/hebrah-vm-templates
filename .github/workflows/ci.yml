@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flake-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = https://microvm.cachix.org
+            extra-trusted-public-keys = microvm.cachix.org-1:oXnBc6hRE3eX5rSYdRyMYXnfzcCxC7yKPTbZXALsqys=
+      - uses: cachix/cachix-action@v15
+        with:
+          name: microvm
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+          signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
+      - name: Show outputs
+        run: nix flake show
+      - name: Format check
+        run: |
+          nix shell nixpkgs#nixfmt-rfc-style --command nixfmt --check \
+            flake.nix templates/*/*.nix packages/*.nix
+      - name: Build sidecar-base (dry-run)
+        run: nix build .#packages.x86_64-linux.sidecar-base --dry-run
+      - name: Build all x86_64-linux templates (dry-run)
+        run: |
+          for t in sidecar-base py-base node-base static-base; do
+            echo "==> $t"
+            nix build ".#packages.x86_64-linux.$t" --dry-run
+          done
+
+  python-parse:
+    name: python syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Byte-compile guest services
+        run: |
+          python -m compileall -q packages/*.py
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: ./scripts
+          ignore_paths: fc-snapshot-lib.sh
