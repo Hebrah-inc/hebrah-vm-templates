@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import subprocess
@@ -205,6 +206,36 @@ class EhrStore:
             ).fetchall()
         return [row["resource_id"] for row in rows]
 
+    def insert_resource(self, resource: dict) -> None:
+        resource_type = resource.get("resourceType")
+        resource_id = resource.get("id")
+        if not resource_type or not resource_id:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO resources (resource_type, resource_id, payload) VALUES (?, ?, ?)",
+                (resource_type, resource_id, json.dumps(resource)),
+            )
+
+    def search_resources(
+        self,
+        resource_type: str,
+        *,
+        patient: str | None = None,
+        category: str | None = None,
+    ) -> list[dict]:
+        resources: list[dict] = []
+        for resource_id in self.list_ids(resource_type):
+            payload = self.get_resource(resource_type, resource_id)
+            if not payload:
+                continue
+            if patient and not _resource_matches_patient(payload, patient):
+                continue
+            if category and _resource_category(payload) != category:
+                continue
+            resources.append(payload)
+        return resources
+
     def metadata(self) -> dict:
         return {
             "resourceType": "CapabilityStatement",
@@ -241,6 +272,38 @@ HANDOFF_ACTIVE = False
 _HANDOFF_LOCK = threading.Lock()
 FHIR_PORT = 8090
 ADMIN_PORT = 8091
+
+
+def _resource_category(resource: dict) -> str | None:
+    categories = resource.get("category") or []
+    if not categories:
+        return None
+    first = categories[0] if isinstance(categories[0], dict) else {}
+    codings = first.get("coding") or []
+    if not codings:
+        return None
+    coding = codings[0] if isinstance(codings[0], dict) else {}
+    return coding.get("code")
+
+
+def _resource_matches_patient(resource: dict, patient_id: str) -> bool:
+    for key in ("subject", "patient", "beneficiary", "for"):
+        ref_obj = resource.get(key)
+        if isinstance(ref_obj, dict):
+            reference = ref_obj.get("reference", "")
+            if reference == f"Patient/{patient_id}":
+                return True
+    for extension in resource.get("extension") or []:
+        if extension.get("url") == "https://hebrah.com/sandbox/patient":
+            ref = extension.get("valueReference") or {}
+            if ref.get("reference") == f"Patient/{patient_id}":
+                return True
+    if resource.get("resourceType") == "Appointment":
+        for participant in resource.get("participant") or []:
+            actor = participant.get("actor") or {}
+            if actor.get("reference") == f"Patient/{patient_id}":
+                return True
+    return False
 
 
 def _handoff_dev_allows_open_admin() -> bool:
@@ -337,7 +400,9 @@ class FhirHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         global STORE, PACK, BASE_PATH
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
         if path == "/health":
             payload = STORE.health_payload() if STORE else {"status": "starting"}
             with _HANDOFF_LOCK:
@@ -364,17 +429,62 @@ class FhirHandler(BaseHTTPRequestHandler):
                     self._json(200, resource)
                     return
             if len(parts) == 1 and parts[0]:
-                ids = STORE.list_ids(parts[0])
+                resource_type = parts[0]
+                patient = (query.get("patient") or [None])[0]
+                category = (query.get("category") or [None])[0]
+                resources = STORE.search_resources(
+                    resource_type,
+                    patient=patient,
+                    category=category,
+                )
                 bundle = {
                     "resourceType": "Bundle",
                     "type": "searchset",
-                    "total": len(ids),
-                    "entry": [{"resource": STORE.get_resource(parts[0], rid)} for rid in ids],
+                    "total": len(resources),
+                    "entry": [{"resource": resource} for resource in resources],
                 }
                 self._json(200, bundle)
                 return
         self.send_response(404)
         self.end_headers()
+
+    def do_POST(self) -> None:
+        global STORE, BASE_PATH
+        if self._handoff_blocks_fhir():
+            self._json(
+                503,
+                {"error": "handoff_active", "message": "FHIR unavailable during tenant handoff"},
+                content_type="application/json",
+            )
+            return
+        parsed = urlparse(self.path)
+        if not STORE or parsed.path != f"{BASE_PATH}/Observation":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._json(400, {"resourceType": "OperationOutcome", "issue": [{"severity": "fatal", "diagnostics": "Invalid JSON"}]})
+            return
+        if not body.get("code"):
+            self._json(
+                400,
+                {
+                    "resourceType": "OperationOutcome",
+                    "issue": [{"severity": "fatal", "diagnostics": "Required code missing", "details": {"coding": [{"code": "59108"}]}}],
+                },
+            )
+            return
+        obs_id = body.get("id") or f"obs_pg_{secrets.token_hex(6)}"
+        body["resourceType"] = "Observation"
+        body["id"] = obs_id
+        if not body.get("status"):
+            body["status"] = "final"
+        STORE.insert_resource(body)
+        self._json(201, body)
 
 
 class AdminHandler(BaseHTTPRequestHandler):
